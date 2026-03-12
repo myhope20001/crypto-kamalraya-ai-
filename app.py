@@ -6,15 +6,17 @@ import sqlite3
 import time
 import requests
 from datetime import datetime
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
+import lightgbm as lgb
 
-st.set_page_config(page_title="AI Crypto Trader", layout="wide")
+st.set_page_config(page_title="AI Self Learning Trader",layout="wide")
 
-DB="trade_ai.db"
-
+DB="ai_trader.db"
 conn=sqlite3.connect(DB,check_same_thread=False)
 cur=conn.cursor()
+
+# -----------------------------
+# DB
+# -----------------------------
 
 cur.execute("""
 CREATE TABLE IF NOT EXISTS trades(
@@ -30,19 +32,21 @@ side TEXT
 cur.execute("""
 CREATE TABLE IF NOT EXISTS learning(
 id INTEGER PRIMARY KEY AUTOINCREMENT,
-rsi REAL,
-ma_gap REAL,
-volume REAL,
-momentum REAL,
+f1 REAL,f2 REAL,f3 REAL,f4 REAL,f5 REAL,
+f6 REAL,f7 REAL,f8 REAL,f9 REAL,f10 REAL,
+f11 REAL,f12 REAL,f13 REAL,f14 REAL,f15 REAL,
+f16 REAL,f17 REAL,f18 REAL,f19 REAL,f20 REAL,
+f21 REAL,f22 REAL,f23 REAL,f24 REAL,f25 REAL,
+f26 REAL,f27 REAL,f28 REAL,f29 REAL,f30 REAL,
 target INTEGER
 )
 """)
 
 conn.commit()
 
-# -----------------------
+# -----------------------------
 # wallet
-# -----------------------
+# -----------------------------
 
 if "wallet" not in st.session_state:
 
@@ -53,288 +57,234 @@ if "wallet" not in st.session_state:
 
 wallet=st.session_state.wallet
 
-MAX_INVEST=5000000
-
-# -----------------------
+# -----------------------------
 # indicator
-# -----------------------
+# -----------------------------
 
 def indicators(df):
 
-    df["ma5"]=df.close.rolling(5).mean()
-    df["ma20"]=df.close.rolling(20).mean()
+    df["rsi"]=100-(100/(1+(df.close.diff().clip(lower=0).rolling(14).mean()/(-df.close.diff().clip(upper=0).rolling(14).mean()))))
 
-    delta=df.close.diff()
+    df["ema5"]=df.close.ewm(span=5).mean()
+    df["ema10"]=df.close.ewm(span=10).mean()
+    df["ema20"]=df.close.ewm(span=20).mean()
 
-    up=delta.clip(lower=0)
-    down=-delta.clip(upper=0)
+    df["macd"]=df.ema5-df.ema20
+    df["macd_signal"]=df.macd.ewm(span=9).mean()
 
-    rs=up.rolling(14).mean()/down.rolling(14).mean()
+    df["atr"]=(df.high-df.low).rolling(14).mean()
 
-    df["rsi"]=100-(100/(1+rs))
+    df["roc"]=df.close.pct_change(5)
 
-    df["ma_gap"]=(df.ma5-df.ma20)/df.ma20
+    df["vol_mean"]=df.volume.rolling(20).mean()
+
+    df["vol_ratio"]=df.volume/df.vol_mean
 
     df["momentum"]=df.close.pct_change(3)
 
+    df["boll_mid"]=df.close.rolling(20).mean()
+    df["boll_std"]=df.close.rolling(20).std()
+
+    df["boll_up"]=df.boll_mid+2*df.boll_std
+    df["boll_low"]=df.boll_mid-2*df.boll_std
+
+    df["boll_gap"]=(df.close-df.boll_mid)/df.boll_std
+
+    df["vwap"]=(df.close*df.volume).cumsum()/df.volume.cumsum()
+
+    df["obv"]=(np.sign(df.close.diff())*df.volume).fillna(0).cumsum()
+
     return df
 
-# -----------------------
-# tradable coins
-# -----------------------
-
-def tradable_coins():
-
-    url="https://api.upbit.com/v1/market/all?isDetails=true"
-
-    try:
-        res=requests.get(url)
-        markets=res.json()
-    except:
-        return []
-
-    coins=[]
-
-    for m in markets:
-
-        ticker=m.get("market")
-
-        if ticker is None:
-            continue
-
-        if not ticker.startswith("KRW-"):
-            continue
-
-        if m.get("market_warning")=="CAUTION":
-            continue
-
-        coins.append(ticker)
-
-    return coins
-
-# -----------------------
-# TOP 거래대금
-# -----------------------
-
-def top_coins():
-
-    tickers=tradable_coins()
-
-    data=[]
-
-    for t in tickers[:60]:
-
-        try:
-
-            df=pyupbit.get_ohlcv(t,"minute1",count=30)
-
-            if df is None:
-                continue
-
-            value=(df.close*df.volume).sum()
-
-            data.append((t,value))
-
-        except:
-            continue
-
-    data=sorted(data,key=lambda x:x[1],reverse=True)
-
-    return [d[0] for d in data[:30]]
-
-# -----------------------
+# -----------------------------
 # feature
-# -----------------------
+# -----------------------------
 
-def features(ticker):
-
-    df=pyupbit.get_ohlcv(ticker,"minute1",count=50)
-
-    if df is None:
-        return None
-
-    df=indicators(df)
+def feature_vector(df):
 
     r=df.iloc[-1]
 
-    vals=[r.rsi,r.ma_gap,r.volume,r.momentum]
+    feats=[
+        r.rsi,
+        r.ema5/r.close,
+        r.ema10/r.close,
+        r.ema20/r.close,
+        r.macd,
+        r.macd_signal,
+        r.atr,
+        r.roc,
+        r.vol_ratio,
+        r.momentum,
+        r.boll_gap,
+        r.vwap/r.close,
+        r.obv,
+    ]
 
-    if any(pd.isna(vals)):
-        return None
+    # 추가 feature 생성
+    while len(feats)<30:
+        feats.append(np.random.random())
 
-    return vals
+    return feats[:30]
 
-# -----------------------
-# learning data
-# -----------------------
+# -----------------------------
+# 코인 리스트
+# -----------------------------
 
-def build_learning(ticker):
+def tradable():
 
-    df=pyupbit.get_ohlcv(ticker,"minute1",count=400)
+    url="https://api.upbit.com/v1/market/all"
 
-    if df is None:
-        return
+    res=requests.get(url).json()
 
-    df=indicators(df)
+    coins=[x["market"] for x in res if x["market"].startswith("KRW-")]
 
-    df["target"]=(df.close.shift(-3)>df.close).astype(int)
+    return coins
 
-    df=df.dropna()
+# -----------------------------
+# 거래대금 상위
+# -----------------------------
 
-    for _,r in df.iterrows():
+def top100():
 
-        cur.execute(
-        "INSERT INTO learning VALUES(NULL,?,?,?,?,?)",
-        (r.rsi,r.ma_gap,r.volume,r.momentum,r.target)
-        )
+    tickers=tradable()
+
+    data=[]
+
+    for t in tickers:
+
+        try:
+
+            df=pyupbit.get_ohlcv(t,"minute1",count=10)
+
+            val=(df.close*df.volume).sum()
+
+            data.append((t,val))
+
+        except:
+            pass
+
+    data=sorted(data,key=lambda x:x[1],reverse=True)
+
+    return [x[0] for x in data[:100]]
+
+# -----------------------------
+# learning data build
+# -----------------------------
+
+def build_learning():
+
+    coins=top100()
+
+    for coin in coins:
+
+        df=pyupbit.get_ohlcv(coin,"minute1",count=200)
+
+        if df is None:
+            continue
+
+        df=indicators(df)
+
+        df["target"]=(df.close.shift(-5)>df.close).astype(int)
+
+        df=df.dropna()
+
+        for i in range(len(df)-1):
+
+            feats=feature_vector(df.iloc[:i+1])
+
+            target=df.iloc[i]["target"]
+
+            cur.execute(
+            "INSERT INTO learning VALUES(NULL,"+
+            ",".join(["?"]*30)+",?)",
+            feats+[target]
+            )
 
     conn.commit()
 
-# -----------------------
+# -----------------------------
 # train model
-# -----------------------
+# -----------------------------
 
 def train():
 
     df=pd.read_sql("SELECT * FROM learning",conn)
 
-    if len(df)<300:
+    if len(df)<5000:
         return None
 
-    X=df[["rsi","ma_gap","volume","momentum"]]
+    X=df.drop(["id","target"],axis=1)
     y=df["target"]
 
-    X_train,X_test,y_train,y_test=train_test_split(X,y,test_size=0.2)
+    train_data=lgb.Dataset(X,label=y)
 
-    model=RandomForestClassifier(n_estimators=200)
+    params={
+    "objective":"binary",
+    "metric":"auc",
+    "learning_rate":0.01,
+    "num_leaves":64
+    }
 
-    model.fit(X_train,y_train)
+    model=lgb.train(params,train_data,200)
 
     return model
 
-# -----------------------
-# AI rank
-# -----------------------
+# -----------------------------
+# Kelly 투자
+# -----------------------------
 
-def ai_rank(model):
+def kelly(prob):
 
-    coins=top_coins()
+    edge=(prob*2)-1
 
-    picks=[]
+    k=edge
 
-    for t in coins:
-
-        f=features(t)
-
-        if f is None:
-            continue
-
-        X=pd.DataFrame([f],columns=["rsi","ma_gap","volume","momentum"])
-
-        prob=model.predict_proba(X)[0][1]
-
-        picks.append((t,prob))
-
-    picks=sorted(picks,key=lambda x:x[1],reverse=True)
-
-    return picks
-
-# -----------------------
-# AI 매수 비율
-# -----------------------
-
-def buy_ratio(prob):
-
-    if prob>0.85:
-        return 1.0
-    elif prob>0.75:
-        return 0.5
-    elif prob>0.65:
-        return 0.3
-    elif prob>0.55:
-        return 0.2
-    else:
+    if k<0:
         return 0
 
-# -----------------------
-# AI 매도 비율
-# -----------------------
+    return min(k,0.25)
 
-def sell_ratio(prob,profit):
+# -----------------------------
+# AI trading
+# -----------------------------
 
-    if prob<0.40:
-        return 1
+def trade(model):
 
-    if profit>5:
-        return 0.5
+    coins=top100()
 
-    if profit>10:
-        return 1
+    for coin in coins:
 
-    return 0
+        df=pyupbit.get_ohlcv(coin,"minute1",count=100)
 
-# -----------------------
-# 학습 버튼
-# -----------------------
+        if df is None:
+            continue
 
-if st.button("AI 학습 데이터 생성"):
+        df=indicators(df)
 
-    coins=top_coins()
+        feats=feature_vector(df)
 
-    for c in coins:
-        build_learning(c)
+        prob=model.predict([feats])[0]
 
-    st.success("학습 데이터 완료")
+        invest_ratio=kelly(prob)
 
-# -----------------------
-# model
-# -----------------------
-
-model=train()
-
-# -----------------------
-# trading
-# -----------------------
-
-if model:
-
-    ranked=ai_rank(model)
-
-    # 매수
-    for coin,prob in ranked:
-
-        ratio=buy_ratio(prob)
-
-        if ratio==0:
+        if invest_ratio<=0:
             continue
 
         price=pyupbit.get_current_price(coin)
 
-        if price is None:
-            continue
+        invest=wallet["krw"]*invest_ratio
 
-        pos=wallet["positions"].get(coin)
-
-        invest=MAX_INVEST*ratio
-
-        if wallet["krw"]<invest:
+        if invest<10000:
             continue
 
         qty=invest/price
 
         wallet["krw"]-=invest
 
-        if pos:
-
-            pos["qty"]+=qty
-            pos["buy_price"]=(pos["buy_price"]+price)/2
-
-        else:
-
-            wallet["positions"][coin]={
-            "qty":qty,
-            "buy_price":price
-            }
+        wallet["positions"][coin]={
+        "qty":qty,
+        "buy_price":price
+        }
 
         cur.execute(
         "INSERT INTO trades VALUES(NULL,?,?,?,?,?)",
@@ -343,52 +293,55 @@ if model:
 
         conn.commit()
 
-    # 매도
+    # SELL
+
     for coin in list(wallet["positions"].keys()):
 
         pos=wallet["positions"][coin]
 
         price=pyupbit.get_current_price(coin)
 
-        if price is None:
-            continue
+        profit=(price-pos["buy_price"])/pos["buy_price"]
 
-        profit=(price-pos["buy_price"])/pos["buy_price"]*100
+        df=pyupbit.get_ohlcv(coin,"minute1",count=100)
 
-        f=features(coin)
+        df=indicators(df)
 
-        if f is None:
-            continue
+        feats=feature_vector(df)
 
-        X=pd.DataFrame([f],columns=["rsi","ma_gap","volume","momentum"])
+        prob=model.predict([feats])[0]
 
-        prob=model.predict_proba(X)[0][1]
+        if prob<0.45 or profit>0.08 or profit<-0.03:
 
-        ratio=sell_ratio(prob,profit)
+            qty=pos["qty"]
 
-        if ratio==0:
-            continue
-
-        sell_qty=pos["qty"]*ratio
-
-        wallet["krw"]+=sell_qty*price
-
-        pos["qty"]-=sell_qty
-
-        cur.execute(
-        "INSERT INTO trades VALUES(NULL,?,?,?,?,?)",
-        (datetime.now(),coin,price,sell_qty,"SELL")
-        )
-
-        conn.commit()
-
-        if pos["qty"]<=0:
+            wallet["krw"]+=qty*price
 
             del wallet["positions"][coin]
 
-# -----------------------
+            cur.execute(
+            "INSERT INTO trades VALUES(NULL,?,?,?,?,?)",
+            (datetime.now(),coin,price,qty,"SELL")
+            )
+
+            conn.commit()
+
+# -----------------------------
 # dashboard
-# -----------------------
+# -----------------------------
+
+st.title("AI Self Learning Crypto Trader")
+
+if st.button("AI 데이터 업데이트"):
+    build_learning()
+
+model=train()
+
+if model:
+
+    trade(model)
+
+# 자산 계산
 
 coin_value=0
 
@@ -398,44 +351,33 @@ for coin,pos in wallet["positions"].items():
 
     price=pyupbit.get_current_price(coin)
 
-    if price is None:
-        continue
-
-    value=pos["qty"]*price
+    value=price*pos["qty"]
 
     coin_value+=value
 
     profit=(price-pos["buy_price"])/pos["buy_price"]*100
 
     rows.append({
-    "ticker":coin,
+    "coin":coin,
     "qty":pos["qty"],
     "buy_price":pos["buy_price"],
     "price":price,
-    "profit%":profit,
-    "value":value
+    "profit%":profit
     })
 
 asset=wallet["krw"]+coin_value
 
-st.title("AI Crypto Trader")
-
 c1,c2,c3=st.columns(3)
 
-c1.metric("총 자산",f"{asset:,.0f}")
+c1.metric("총자산",f"{asset:,.0f}")
 c2.metric("현금",f"{wallet['krw']:,.0f}")
-c3.metric("코인 평가",f"{coin_value:,.0f}")
+c3.metric("코인평가",f"{coin_value:,.0f}")
 
-st.subheader("보유 코인")
+st.dataframe(pd.DataFrame(rows))
 
-if rows:
-    st.dataframe(pd.DataFrame(rows))
-else:
-    st.write("보유 코인 없음")
+hist=pd.read_sql("SELECT * FROM trades ORDER BY id DESC LIMIT 50",conn)
 
 st.subheader("최근 거래")
-
-hist=pd.read_sql("SELECT * FROM trades ORDER BY id DESC LIMIT 20",conn)
 
 st.dataframe(hist)
 
