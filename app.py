@@ -1,43 +1,59 @@
+# -*- coding: utf-8 -*-
+
 import streamlit as st
 import pyupbit
 import pandas as pd
 import numpy as np
 import sqlite3
-import time
-import requests
-from datetime import datetime
 import lightgbm as lgb
+import requests
+import time
 
-st.set_page_config(page_title="AI Self Learning Trader",layout="wide")
+from datetime import datetime
 
-DB="ai_trader.db"
-conn=sqlite3.connect(DB,check_same_thread=False)
+# -----------------------------
+# DB 연결
+# -----------------------------
+
+conn=sqlite3.connect("ai_trader.db",check_same_thread=False)
 cur=conn.cursor()
 
 # -----------------------------
-# DB
+# 테이블 생성
 # -----------------------------
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS wallet(
+id INTEGER PRIMARY KEY,
+krw REAL
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS positions(
+coin TEXT,
+qty REAL,
+buy_price REAL
+)
+""")
 
 cur.execute("""
 CREATE TABLE IF NOT EXISTS trades(
 id INTEGER PRIMARY KEY AUTOINCREMENT,
 time TEXT,
-ticker TEXT,
+coin TEXT,
 price REAL,
 qty REAL,
 side TEXT
 )
 """)
 
-cur.execute("""
+cols=",".join([f"f{i} REAL" for i in range(30)])
+
+cur.execute(f"""
 CREATE TABLE IF NOT EXISTS learning(
 id INTEGER PRIMARY KEY AUTOINCREMENT,
-f1 REAL,f2 REAL,f3 REAL,f4 REAL,f5 REAL,
-f6 REAL,f7 REAL,f8 REAL,f9 REAL,f10 REAL,
-f11 REAL,f12 REAL,f13 REAL,f14 REAL,f15 REAL,
-f16 REAL,f17 REAL,f18 REAL,f19 REAL,f20 REAL,
-f21 REAL,f22 REAL,f23 REAL,f24 REAL,f25 REAL,
-f26 REAL,f27 REAL,f28 REAL,f29 REAL,f30 REAL,
+{cols},
 target INTEGER
 )
 """)
@@ -45,59 +61,96 @@ target INTEGER
 conn.commit()
 
 # -----------------------------
-# wallet
+# 최초 자금 세팅
 # -----------------------------
 
-if "wallet" not in st.session_state:
+cur.execute("SELECT * FROM wallet")
 
-    st.session_state.wallet={
-        "krw":10000000.0,
-        "positions":{}
-    }
+if cur.fetchone() is None:
 
-wallet=st.session_state.wallet
+    cur.execute(
+    "INSERT INTO wallet VALUES(1,10000000)"
+    )
+
+    conn.commit()
 
 # -----------------------------
-# indicator
+# 지갑 로드
+# -----------------------------
+
+def load_wallet():
+
+    krw=cur.execute(
+    "SELECT krw FROM wallet WHERE id=1"
+    ).fetchone()[0]
+
+    rows=cur.execute(
+    "SELECT * FROM positions"
+    ).fetchall()
+
+    pos={}
+
+    for r in rows:
+
+        pos[r[0]]={
+        "qty":r[1],
+        "buy_price":r[2]
+        }
+
+    return {"krw":krw,"positions":pos}
+
+# -----------------------------
+# 지갑 저장
+# -----------------------------
+
+def save_wallet(wallet):
+
+    cur.execute(
+    "UPDATE wallet SET krw=? WHERE id=1",
+    (wallet["krw"],)
+    )
+
+    cur.execute("DELETE FROM positions")
+
+    for coin,p in wallet["positions"].items():
+
+        cur.execute(
+        "INSERT INTO positions VALUES(?,?,?)",
+        (coin,p["qty"],p["buy_price"])
+        )
+
+    conn.commit()
+
+# -----------------------------
+# 지표 생성
 # -----------------------------
 
 def indicators(df):
 
-    df["rsi"]=100-(100/(1+(df.close.diff().clip(lower=0).rolling(14).mean()/(-df.close.diff().clip(upper=0).rolling(14).mean()))))
+    df["rsi"]=df.close.pct_change().rolling(14).mean()
 
-    df["ema5"]=df.close.ewm(span=5).mean()
-    df["ema10"]=df.close.ewm(span=10).mean()
-    df["ema20"]=df.close.ewm(span=20).mean()
+    df["ma5"]=df.close.rolling(5).mean()
 
-    df["macd"]=df.ema5-df.ema20
-    df["macd_signal"]=df.macd.ewm(span=9).mean()
+    df["ma20"]=df.close.rolling(20).mean()
 
-    df["atr"]=(df.high-df.low).rolling(14).mean()
+    df["momentum"]=df.close/df.close.shift(5)
 
     df["roc"]=df.close.pct_change(5)
 
-    df["vol_mean"]=df.volume.rolling(20).mean()
+    df["vol_ratio"]=df.volume/df.volume.rolling(10).mean()
 
-    df["vol_ratio"]=df.volume/df.vol_mean
+    df["boll_gap"]=(df.close-df.ma20)/df.ma20
 
-    df["momentum"]=df.close.pct_change(3)
-
-    df["boll_mid"]=df.close.rolling(20).mean()
-    df["boll_std"]=df.close.rolling(20).std()
-
-    df["boll_up"]=df.boll_mid+2*df.boll_std
-    df["boll_low"]=df.boll_mid-2*df.boll_std
-
-    df["boll_gap"]=(df.close-df.boll_mid)/df.boll_std
+    df["obv"]=(np.sign(df.close.diff())*df.volume).fillna(0).cumsum()
 
     df["vwap"]=(df.close*df.volume).cumsum()/df.volume.cumsum()
 
-    df["obv"]=(np.sign(df.close.diff())*df.volume).fillna(0).cumsum()
+    df["atr"]=(df.high-df.low).rolling(14).mean()
 
     return df
 
 # -----------------------------
-# feature
+# feature vector
 # -----------------------------
 
 def feature_vector(df):
@@ -105,23 +158,22 @@ def feature_vector(df):
     r=df.iloc[-1]
 
     feats=[
+
         r.rsi,
-        r.ema5/r.close,
-        r.ema10/r.close,
-        r.ema20/r.close,
-        r.macd,
-        r.macd_signal,
+        r.ma5/r.close,
+        r.ma20/r.close,
         r.atr,
         r.roc,
         r.vol_ratio,
         r.momentum,
         r.boll_gap,
         r.vwap/r.close,
-        r.obv,
+        r.obv
+
     ]
 
-    # 추가 feature 생성
     while len(feats)<30:
+
         feats.append(np.random.random())
 
     return feats[:30]
@@ -214,15 +266,18 @@ def train():
         return None
 
     X=df.drop(["id","target"],axis=1)
+
     y=df["target"]
 
     train_data=lgb.Dataset(X,label=y)
 
     params={
+
     "objective":"binary",
     "metric":"auc",
     "learning_rate":0.01,
     "num_leaves":64
+
     }
 
     model=lgb.train(params,train_data,200)
@@ -248,11 +303,16 @@ def kelly(prob):
 # AI trading
 # -----------------------------
 
-def trade(model):
+def trade(model,wallet):
 
     coins=top100()
 
+    # BUY
+
     for coin in coins:
+
+        if coin in wallet["positions"]:
+            continue
 
         df=pyupbit.get_ohlcv(coin,"minute1",count=100)
 
@@ -282,16 +342,16 @@ def trade(model):
         wallet["krw"]-=invest
 
         wallet["positions"][coin]={
+
         "qty":qty,
         "buy_price":price
+
         }
 
         cur.execute(
         "INSERT INTO trades VALUES(NULL,?,?,?,?,?)",
         (datetime.now(),coin,price,qty,"BUY")
         )
-
-        conn.commit()
 
     # SELL
 
@@ -324,7 +384,9 @@ def trade(model):
             (datetime.now(),coin,price,qty,"SELL")
             )
 
-            conn.commit()
+    conn.commit()
+
+    save_wallet(wallet)
 
 # -----------------------------
 # dashboard
@@ -332,19 +394,19 @@ def trade(model):
 
 st.title("AI Self Learning Crypto Trader")
 
+wallet=load_wallet()
+
 if st.button("AI 데이터 업데이트"):
     build_learning()
 
 model=train()
 
 if model:
-
-    trade(model)
+    trade(model,wallet)
 
 # 자산 계산
 
 coin_value=0
-
 rows=[]
 
 for coin,pos in wallet["positions"].items():
@@ -358,11 +420,13 @@ for coin,pos in wallet["positions"].items():
     profit=(price-pos["buy_price"])/pos["buy_price"]*100
 
     rows.append({
+
     "coin":coin,
     "qty":pos["qty"],
     "buy_price":pos["buy_price"],
     "price":price,
     "profit%":profit
+
     })
 
 asset=wallet["krw"]+coin_value
@@ -375,7 +439,10 @@ c3.metric("코인평가",f"{coin_value:,.0f}")
 
 st.dataframe(pd.DataFrame(rows))
 
-hist=pd.read_sql("SELECT * FROM trades ORDER BY id DESC LIMIT 50",conn)
+hist=pd.read_sql(
+"SELECT * FROM trades ORDER BY id DESC LIMIT 50",
+conn
+)
 
 st.subheader("최근 거래")
 
